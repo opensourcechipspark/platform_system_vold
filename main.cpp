@@ -36,10 +36,12 @@
 #include "NetlinkManager.h"
 #include "DirectVolume.h"
 #include "cryptfs.h"
-
+#include "G3Dev.h"
+#include  "MiscManager.h"
+#include <sysutils/NetlinkEvent.h>
 static int process_config(VolumeManager *vm);
 static void coldboot(const char *path);
-
+static void rk_parse_resolution();
 #define FSTAB_PREFIX "/fstab."
 struct fstab *fstab;
 
@@ -50,7 +52,7 @@ int main() {
     NetlinkManager *nm;
 
     SLOGI("Vold 2.1 (the revenge) firing up");
-
+    rk_parse_resolution();
     mkdir("/dev/block/vold", 0755);
 
     /* For when cryptfs checks and mounts an encrypted filesystem */
@@ -85,7 +87,22 @@ int main() {
         SLOGE("Unable to start NetlinkManager (%s)", strerror(errno));
         exit(1);
     }
-
+ #ifdef USE_USB_MODE_SWITCH
+      SLOGE("Start Misc devices Manager...");
+      MiscManager *mm;
+         if (!(mm = MiscManager::Instance())) {
+		 SLOGE("Unable to create MiscManager");
+		 exit(1);
+		};
+	  mm->setBroadcaster((SocketListener *) cl);
+	     if (mm->start()) {
+		 SLOGE("Unable to start MiscManager (%s)", strerror(errno));
+	     exit(1);
+	    }
+	  G3Dev* g3 = new G3Dev(mm);
+	  g3->handleUsb();
+	  mm->addMisc(g3);
+#endif
     coldboot("/sys/block");
 //    coldboot("/sys/class/switch");
 
@@ -101,11 +118,28 @@ int main() {
     while(1) {
         sleep(1000);
     }
-
+   
     SLOGI("Vold exiting");
     exit(0);
 }
 
+ static void rk_parse_resolution(){
+   //add lly@rock-chips.com
+   FILE *fp = fopen("/data/system/storeresolution.bin", "r");
+   if (fp) {
+		char line[2];
+		fread(line, 1, 1, fp);
+	    SLOGE("==================================================%x====",line[0]);
+		 if (!strcmp(line,"0")){
+			property_set("sys.SD2HD", "true");
+			property_set("ro.sf.lcd_density", "240");
+		 } else{
+			property_set("sys.SD2HD", "false");
+			property_set("ro.sf.lcd_density", "320");
+		}
+		fclose(fp);
+	}
+}
 static void do_coldboot(DIR *d, int lvl)
 {
     struct dirent *de;

@@ -31,7 +31,7 @@
 #include "ResponseCode.h"
 #include "cryptfs.h"
 
-// #define PARTITION_DEBUG
+#define PARTITION_DEBUG
 
 DirectVolume::DirectVolume(VolumeManager *vm, const fstab_rec* rec, int flags) :
         Volume(vm, rec, flags) {
@@ -42,6 +42,7 @@ DirectVolume::DirectVolume(VolumeManager *vm, const fstab_rec* rec, int flags) :
     mDiskMajor = -1;
     mDiskMinor = -1;
     mDiskNumParts = 0;
+    mIsDecrypted = 0;
 
     if (strcmp(rec->mount_point, "auto") != 0) {
         ALOGE("Vold managed volumes must have auto mount point; ignoring %s",
@@ -130,6 +131,10 @@ int DirectVolume::handleBlockEvent(NetlinkEvent *evt) {
                 }
             } else if (action == NetlinkEvent::NlActionRemove) {
                 if (!strcmp(devtype, "disk")) {
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+                    if (!strcmp(getLabel(),USB_DISK_LABEL))
+                        handlePartitionRemoved(dp, evt);
+#endif
                     handleDiskRemoved(dp, evt);
                 } else {
                     handlePartitionRemoved(dp, evt);
@@ -163,6 +168,12 @@ void DirectVolume::handleDiskAdded(const char *devpath, NetlinkEvent *evt) {
         mDiskNumParts = 1;
     }
 
+#ifdef PARTITION_DEBUG
+	SLOGD("----handleDiskAdded,mDiskNumParts =%d,mDiskMajor=%d,mDiskMinor=%d",mDiskNumParts,mDiskMajor,mDiskMinor);
+#endif
+
+    char msg[255];
+
     int partmask = 0;
     int i;
     for (i = 1; i <= mDiskNumParts; i++) {
@@ -175,6 +186,10 @@ void DirectVolume::handleDiskAdded(const char *devpath, NetlinkEvent *evt) {
         SLOGD("Dv::diskIns - No partitions - good to go son!");
 #endif
         setState(Volume::State_Idle);
+	    snprintf(msg, sizeof(msg), "Volume %s %s disk inserted (%d:%d)",
+	             getLabel(), getMountpoint(), mDiskMajor, mDiskMinor);
+	    mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeDiskInserted,msg, false);
+
     } else {
 #ifdef PARTITION_DEBUG
         SLOGD("Dv::diskIns - waiting for %d partitions (mask 0x%x)",
@@ -205,9 +220,15 @@ void DirectVolume::handlePartitionAdded(const char *devpath, NetlinkEvent *evt) 
     }
 
     if (part_num > mDiskNumParts) {
-        mDiskNumParts = part_num;
+        if (mDiskNumParts == 0)
+            mDiskNumParts = part_num;
+        else
+            part_num = mDiskNumParts;
     }
 
+#ifdef PARTITION_DEBUG
+	SLOGD("---handlePartitionAdded,part_num=%d,major=%d,minor=%d",part_num,major,minor);
+#endif
     if (major != mDiskMajor) {
         SLOGE("Partition '%s' has a different major than its disk!", devpath);
         return;
@@ -283,12 +304,46 @@ void DirectVolume::handleDiskRemoved(const char *devpath, NetlinkEvent *evt) {
     int major = atoi(evt->findParam("MAJOR"));
     int minor = atoi(evt->findParam("MINOR"));
     char msg[255];
+	char devicePath[255];
     bool enabled;
 
     if (mVm->shareEnabled(getLabel(), "ums", &enabled) == 0 && enabled) {
         mVm->unshareVolume(getLabel(), "ums");
     }
 
+    sprintf(devicePath, "/dev/block/vold/%d:%d", major,minor);
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    /*
+    * TODO :: check every partition was unmounted
+    */
+    if (!strcmp(getLabel(),USB_DISK_LABEL)){
+       if (!isPartitionEmpty()){
+           setState(Volume::State_Mounted);
+           return;
+       }
+       SLOGD("Udisk has no partitions, now unmounting /mnt/usb_storage !");
+    }
+#endif
+
+    if (access(devicePath, R_OK) == 0) {
+        SLOGD("current mounted dev exist,access devicePath: %s ;partitionNum: %d", devicePath, mDiskNumParts);
+
+        /*
+         * Confirm partition removed.
+         */
+         if (Volume::unmountVol(true, false)) {
+            SLOGE("Failed to unmount volume on bad removal (%s)",
+                 strerror(errno));
+             // XXX: At this point we're screwed for now
+         } else {
+             SLOGD("Crisis averted");
+         }
+
+         SLOGE("handlePartitionRemoved,ready to unlink: %s",devicePath);
+         if ( 0 != unlink(devicePath) ) {
+             SLOGE("Failed to unlink %s",devicePath);
+         }
+    }
     SLOGD("Volume %s %s disk %d:%d removed\n", getLabel(), getMountpoint(), major, minor);
     snprintf(msg, sizeof(msg), "Volume %s %s disk removed (%d:%d)",
              getLabel(), getFuseMountpoint(), major, minor);
@@ -304,6 +359,29 @@ void DirectVolume::handlePartitionRemoved(const char *devpath, NetlinkEvent *evt
     int state;
 
     SLOGD("Volume %s %s partition %d:%d removed\n", getLabel(), getMountpoint(), major, minor);
+
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    if(!strcmp(getLabel(),USB_DISK_LABEL)){
+       if (Volume::unmountPartition(major,minor)){
+           SLOGE("Failed to unmount volume on bad removal (%s)", strerror(errno));
+       } else {
+           SLOGD("Crisis averted %d:%d",major,minor);
+       }
+
+       char devicePath[255];
+       sprintf(devicePath, "/dev/block/vold/%d:%d", major,minor);
+       SLOGD("handlePartitionRemoved,ready to unlink: %s (%s)",devicePath,devpath);
+       if ( 0 != unlink(devicePath) ) {
+           SLOGE("Failed to unlink %s",devicePath);
+       } 
+
+       snprintf(msg, sizeof(msg), "Volume %s %s bad removal (%d:%d)",
+                   getLabel(), getMountpoint(), major, minor);
+       mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeBadRemoval,
+                           msg, false);
+       return;
+    }
+#endif
 
     /*
      * The framework doesn't need to get notified of
@@ -340,8 +418,8 @@ void DirectVolume::handlePartitionRemoved(const char *devpath, NetlinkEvent *evt
         }
     } else if (state == Volume::State_Shared) {
         /* removed during mass storage */
-        snprintf(msg, sizeof(msg), "Volume %s bad removal (%d:%d)",
-                 getLabel(), major, minor);
+	 snprintf(msg, sizeof(msg), "Volume %s %s bad removal (%d:%d)",
+                 getLabel(), getMountpoint(), major, minor);
         mVm->getBroadcaster()->sendBroadcast(ResponseCode::VolumeBadRemoval,
                                              msg, false);
 
@@ -463,3 +541,39 @@ int DirectVolume::getVolInfo(struct volume_info *v)
 
     return 0;
 }
+
+
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+const char* DirectVolume::getUdiskMountpoint(char* devicepath,int major,int minor,char letter)
+{
+    SLOGD("GET MOUNTPOINT:%s DEVICEPATH:%s",mMountpoint,devicepath);
+    if (!strcmp(getLabel(),USB_DISK_LABEL))
+    {
+        Partitions::iterator ir;
+        for (ir = mPartitions.begin(); ir != mPartitions.end(); ++ir)
+        {
+            if (((VolumePartition*)*ir)->major == major && ((VolumePartition*)*ir)->minor == minor)
+            {
+                return ((VolumePartition*)*ir)->mountpoint;
+            }
+        }
+
+        /* If no letter*/
+        if (!letter)
+        {
+            return NULL;
+        }
+
+        /* If Unmounted*/
+        char mount_point[255]={0};
+        char vLabel[255]={0};
+        getVolumeLabel(devicepath,vLabel,letter);
+        sprintf(mount_point,"%s/%s",mMountpoint,vLabel);
+        return mount_point;
+    }
+    /* Dont try to call this function but udisk.
+     * If you try, we return value same as getMountpoint();
+     */
+    return mMountpoint;
+}
+#endif

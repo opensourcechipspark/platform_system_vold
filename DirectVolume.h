@@ -50,7 +50,10 @@ public:
     int addPath(const char *path);
 
     const char *getMountpoint() { return mMountpoint; }
-    const char *getFuseMountpoint() { return mFuseMountpoint; }
+    const char *getFuseMountpoint() { return mMountpoint; }//mFuseMountpoint
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    const char *getUdiskMountpoint(char* devicepath,int major,int minor,char letter);
+#endif
 
     int handleBlockEvent(NetlinkEvent *evt);
     dev_t getDiskDevice();

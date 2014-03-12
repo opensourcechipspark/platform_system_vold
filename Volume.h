@@ -23,6 +23,17 @@
 class NetlinkEvent;
 class VolumeManager;
 
+#define USB_DISK_LABEL "usb_storage"
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+struct VolumePartition {
+    int major;
+    int minor;
+    char letter;
+    char mountpoint[255];
+};
+typedef android::List<VolumePartition *> Partitions;
+#endif
+
 class Volume {
 private:
     int mState;
@@ -57,6 +68,10 @@ protected:
     int mPartIdx;
     int mOrigPartIdx;
     bool mRetryMount;
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    Partitions mPartitions;
+    int32_t mLetters;
+#endif
 
     /*
      * The major/minor tuple of the currently mounted filesystem.
@@ -69,6 +84,9 @@ public:
 
     int mountVol();
     int unmountVol(bool force, bool revert);
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    int unmountPartition(int major, int minor);
+#endif
     int formatVol(bool wipe);
 
     const char* getLabel() { return mLabel; }
@@ -80,6 +98,10 @@ public:
     /* Mountpoint of the raw volume */
     virtual const char *getMountpoint() = 0;
     virtual const char *getFuseMountpoint() = 0;
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    virtual const char *getUdiskMountpoint(char* devicepath,int major,int minor,char letter) = 0;
+    bool isPartitionEmpty() {return mPartitions.empty();}
+#endif
 
     virtual int handleBlockEvent(NetlinkEvent *evt);
     virtual dev_t getDiskDevice();
@@ -94,6 +116,9 @@ protected:
     void setUuid(const char* uuid);
     void setUserLabel(const char* userLabel);
     void setState(int state);
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    void getVolumeLabel(const char* devicepath, char*, char letter);
+#endif
 
     virtual int getDeviceNodes(dev_t *devs, int max) = 0;
     virtual int updateDeviceInfo(char *new_path, int new_major, int new_minor) = 0;
@@ -108,6 +133,12 @@ private:
     int mountAsecExternal();
     int doUnmount(const char *path, bool force);
     int extractMetadata(const char* devicePath);
+	void notifyStateKernel(int number);
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    size_t gb2312_to_utf8(char* pOut,size_t pOutLen, char* pIn, size_t pInlen) ;
+    char getNextLetter();
+    void releaseLetter(char letter);
+#endif
 };
 
 typedef android::List<Volume *> VolumeCollection;

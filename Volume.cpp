@@ -42,12 +42,19 @@
 
 #include <string>
 
+#include "Ntfs.h"
 #include "Volume.h"
 #include "VolumeManager.h"
 #include "ResponseCode.h"
 #include "Fat.h"
 #include "Process.h"
 #include "cryptfs.h"
+
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS 
+#include "blkid/blkid.h"  
+#include "unicode/ucnv.h"
+#define MAX_DEVICE_NODES 32
+#endif
 
 extern "C" void dos_partition_dec(void const *pp, struct dos_partition *d);
 extern "C" void dos_partition_enc(void *pp, struct dos_partition *d);
@@ -56,7 +63,7 @@ extern "C" void dos_partition_enc(void *pp, struct dos_partition *d);
 /*
  * Media directory - stuff that only media_rw user can see
  */
-const char *Volume::MEDIA_DIR           = "/mnt/media_rw";
+const char *Volume::MEDIA_DIR           = "/mnt";//"/mnt/media_rw
 
 /*
  * Fuse directory - location where fuse wrapped filesystems go
@@ -121,6 +128,9 @@ Volume::Volume(VolumeManager *vm, const fstab_rec* rec, int flags) {
     mCurrentlyMountedKdev = -1;
     mPartIdx = rec->partnum;
     mRetryMount = false;
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    mLetters = 0;
+#endif
 }
 
 Volume::~Volume() {
@@ -192,6 +202,30 @@ void Volume::setUserLabel(const char* userLabel) {
             msg, false);
 }
 
+//to inform SDMMC-driver for umounting sdcard. noted by xbw@2011-06-07
+void Volume::notifyStateKernel(int number)
+{
+    if(!strcmp(getLabel(),"external_sd"))
+    {
+        FILE *fp = fopen("/sys/sd-sdio/rescan","w");
+        if(fp){
+            char kstate[64] = "sd-";
+
+            if(number == 0) {
+                strcat(kstate,"Ready");//strcat(kstate,stateToStr(Volume::State_Ready));
+            } else {
+                strcat(kstate,stateToStr(mState));
+            }
+            fputs(kstate,fp);
+            SLOGI("Call notifyStateKernel No.%d in the file of Volume.cpp", number);
+            fclose(fp);
+        } else {
+            SLOGI("Error(call No.%d) opening /sys/sd-sdio/rescan in the file of VOlume.cpp", number);
+        }
+    }
+}
+
+
 void Volume::setState(int state) {
     char msg[255];
     int oldState = mState;
@@ -206,6 +240,7 @@ void Volume::setState(int state) {
     }
 
     mState = state;
+	notifyStateKernel(1);//add by xbw
 
     SLOGD("Volume %s state changing %d (%s) -> %d (%s)", mLabel,
          oldState, stateToStr(oldState), mState, stateToStr(mState));
@@ -249,14 +284,19 @@ int Volume::formatVol(bool wipe) {
 
     bool formatEntireDevice = (mPartIdx == -1);
     char devicePath[255];
+    char label[PROPERTY_VALUE_MAX] = "";
     dev_t diskNode = getDiskDevice();
     dev_t partNode =
         MKDEV(MAJOR(diskNode),
               MINOR(diskNode) + (formatEntireDevice ? 1 : mPartIdx));
 
     setState(Volume::State_Formatting);
-
     int ret = -1;
+	
+    if (!strcmp(getLabel(),"internal_sd")) {
+    	property_get("UserVolumeLabel", label, "");
+        formatEntireDevice = false;
+    }
     // Only initialize the MBR if we are formatting the entire device
     if (formatEntireDevice) {
         sprintf(devicePath, "/dev/block/vold/%d:%d",
@@ -268,16 +308,24 @@ int Volume::formatVol(bool wipe) {
         }
     }
 
-    sprintf(devicePath, "/dev/block/vold/%d:%d",
-            MAJOR(partNode), MINOR(partNode));
+    if (!strcmp(getLabel(),"internal_sd") && MAJOR(diskNode) != 179) {
+        sprintf(devicePath, "/dev/block/vold/%d:%d",
+                MAJOR(diskNode), MINOR(diskNode));
+    } else {
+        sprintf(devicePath, "/dev/block/vold/%d:%d",
+                MAJOR(partNode), MINOR(partNode));
+    }
 
     if (mDebug) {
         SLOGI("Formatting volume %s (%s)", getLabel(), devicePath);
     }
 
-    if (Fat::format(devicePath, 0, wipe)) {
+    if (Fat::format(devicePath, 0, wipe, label)) {
         SLOGE("Failed to format (%s)", strerror(errno));
         goto err;
+    }
+    if (!strcmp(getLabel(),"internal_sd")) {
+        system("sync");
     }
 
     ret = 0;
@@ -293,6 +341,12 @@ bool Volume::isMountpointMounted(const char *path) {
     char rest[256];
     FILE *fp;
     char line[1024];
+
+    if (!path)
+    {
+        SLOGE("isMountpointMounted path is NULL !");
+        return false;
+    }
 
     if (!(fp = fopen("/proc/mounts", "r"))) {
         SLOGE("Error opening /proc/mounts (%s)", strerror(errno));
@@ -325,10 +379,15 @@ int Volume::mountVol() {
     char decrypt_state[PROPERTY_VALUE_MAX];
     char crypto_state[PROPERTY_VALUE_MAX];
     char encrypt_progress[PROPERTY_VALUE_MAX];
+    char has_ums[PROPERTY_VALUE_MAX];
 
     property_get("vold.decrypt", decrypt_state, "");
     property_get("vold.encrypt_progress", encrypt_progress, "");
+    property_get("ro.factory.hasUMS",has_ums, "false");
 
+    char getSupNtfs[PROPERTY_VALUE_MAX];
+    property_get("ro.factory.storage_suppntfs",getSupNtfs, "true");
+	bool isSupNtfs = !strcmp(getSupNtfs,"true");
     /* Don't try to mount the volumes if we have not yet entered the disk password
      * or are in the process of encrypting.
      */
@@ -349,14 +408,37 @@ int Volume::mountVol() {
         }
         return -1;
     }
-
-    if (isMountpointMounted(getMountpoint())) {
-        SLOGW("Volume is idle but appears to be mounted - fixing");
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    if(strcmp(getLabel(),USB_DISK_LABEL))
+#endif
+    { 
+        if (isMountpointMounted(getMountpoint())) {
+            SLOGW("Volume is idle but appears to be mounted - fixing");
+            setState(Volume::State_Mounted);
+            // mCurrentlyMountedKdev = XXX
+            return 0;
+        }
+    }
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    else
+    {
+        char devicePath[255];                                                                                                                
+        n = getDeviceNodes((dev_t *) &deviceNodes, MAX_DEVICE_NODES);
+        for (int i=0;i<n;i++)
+        {
+            int major = MAJOR(deviceNodes[i]);
+            int minor = MINOR(deviceNodes[i]);
+            sprintf(devicePath, "/dev/block/vold/%d:%d", major,minor);
+            if (!isMountpointMounted(getUdiskMountpoint(devicePath,major,minor,NULL))){
+                goto UDISKNOMOUNTED;
+            }
+        }
+        SLOGW("UDisk Volume is idle but appears to be mounted - fixing");
         setState(Volume::State_Mounted);
-        // mCurrentlyMountedKdev = XXX
         return 0;
     }
-
+UDISKNOMOUNTED:
+#endif
     n = getDeviceNodes((dev_t *) &deviceNodes, 4);
     if (!n) {
         SLOGE("Failed to get device nodes (%s)\n", strerror(errno));
@@ -418,12 +500,12 @@ int Volume::mountVol() {
         sprintf(devicePath, "/dev/block/vold/%d:%d", MAJOR(deviceNodes[i]),
                 MINOR(deviceNodes[i]));
 
-        SLOGI("%s being considered for volume %s\n", devicePath, getLabel());
+        SLOGI("%s being considered for volume %s,%d\n ", devicePath, getLabel(),isSupNtfs);
 
         errno = 0;
         setState(Volume::State_Checking);
 
-        if (Fat::check(devicePath)) {
+        if (Fat::check(devicePath) && !isSupNtfs) {
             if (errno == ENODATA) {
                 SLOGW("%s does not contain a FAT filesystem\n", devicePath);
                 continue;
@@ -438,17 +520,83 @@ int Volume::mountVol() {
         errno = 0;
         int gid;
 
-        if (Fat::doMount(devicePath, getMountpoint(), false, false, false,
-                AID_MEDIA_RW, AID_MEDIA_RW, 0007, true)) {
-            SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
-            continue;
-        }
+        char mount_point[255]={0};
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+        char letter = 'x'; 
+        if (!strcmp(getLabel(),USB_DISK_LABEL)){
+            int major = MAJOR(deviceNodes[i]);
+            int minor = MINOR(deviceNodes[i]);
+            letter = getNextLetter();
+            const char *mountpoint = getUdiskMountpoint(devicePath,major,minor,letter);
+            strcpy(mount_point,mountpoint);
 
+            if (mkdir(mount_point,0000))
+                SLOGD("mountVol,mountpoint : %s",mount_point);
+
+            setState(Volume::State_Checking);
+        }
+        else
+#endif
+        {
+            const char *mountpoint = getMountpoint();
+            strcpy(mount_point,mountpoint);
+        }
+	    if(!strcmp("true",has_ums))//has UMS function ,set group to AID_SDCARD_RW
+	    {
+        	if (Fat::doMount(devicePath, mount_point, false, false, false,
+        	        AID_SYSTEM,AID_SDCARD_RW, 0002, true)) {
+        		SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
+        
+                	if(Ntfs::doMount(devicePath, mount_point, false, 1000)){ 
+               			SLOGE("%s failed to mount via VNTFS (%s)\n", devicePath, strerror(errno));
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+                        if (!strcmp(getLabel(),USB_DISK_LABEL)){
+                            setState(Volume::State_Idle);
+                            rmdir(mount_point);
+                            releaseLetter(letter);
+                        }
+#endif
+                		continue;
+               		}
+        	}
+	    }
+	    else //do not has ums,set group to AID_MEDIA_RW
+	    {
+        	if (Fat::doMount(devicePath, mount_point, false, false, false,
+               		AID_SYSTEM,AID_MEDIA_RW, 0002, true)) {
+            		SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
+            
+			    if(Ntfs::doMount(devicePath, mount_point, false, 1000)){
+               			SLOGE("%s failed to mount via VNTFS (%s)\n", devicePath, strerror(errno));
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+                        if (!strcmp(getLabel(),USB_DISK_LABEL)){
+                            setState(Volume::State_Idle);
+                            rmdir(mount_point);
+                            releaseLetter(letter);
+                        }
+#endif
+		       		continue;
+		     	}
+        	}
+	    }   
+
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+        if (!strcmp(getLabel(),USB_DISK_LABEL)){
+            int major = MAJOR(deviceNodes[i]);
+            int minor = MINOR(deviceNodes[i]);
+            VolumePartition* pt = new VolumePartition();
+            pt->major = major;
+            pt->minor = minor;
+            pt->letter = letter;
+            strcpy(pt->mountpoint,mount_point);
+            mPartitions.push_back(pt);
+        }
+#endif
         extractMetadata(devicePath);
 
         if (providesAsec && mountAsecExternal() != 0) {
             SLOGE("Failed to mount secure area (%s)", strerror(errno));
-            umount(getMountpoint());
+            umount(mount_point);
             setState(Volume::State_Idle);
             return -1;
         }
@@ -459,18 +607,39 @@ int Volume::mountVol() {
 
         setState(Volume::State_Mounted);
         mCurrentlyMountedKdev = deviceNodes[i];
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+        if (!strcmp(getLabel(),USB_DISK_LABEL))
+            continue;
+#endif
         return 0;
     }
 
     SLOGE("Volume %s found no suitable devices for mounting :(\n", getLabel());
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+    if (strcmp(getLabel(),USB_DISK_LABEL))
+    {
+        SLOGE("Volume %s found no suitable devices for mounting :(\n", getLabel());
+        setState(Volume::State_Idle);
+    }   
+    else
+    {
+        SLOGD("Volume usb_storage mounted .");
+        setState(Volume::State_Mounted);
+        return 0;
+    }
+#else
     setState(Volume::State_Idle);
-
+#endif
     return -1;
 }
 
 int Volume::mountAsecExternal() {
     char legacy_path[PATH_MAX];
     char secure_path[PATH_MAX];
+    char has_ums[PROPERTY_VALUE_MAX];
+
+    property_get("ro.factory.hasUMS",has_ums, "false");
+
 
     snprintf(legacy_path, PATH_MAX, "%s/android_secure", getMountpoint());
     snprintf(secure_path, PATH_MAX, "%s/.android_secure", getMountpoint());
@@ -482,9 +651,17 @@ int Volume::mountAsecExternal() {
         }
     }
 
-    if (fs_prepare_dir(secure_path, 0770, AID_MEDIA_RW, AID_MEDIA_RW) != 0) {
-        SLOGW("fs_prepare_dir failed: %s", strerror(errno));
-        return -1;
+    if(!strcmp("true",has_ums))//has UMS function ,set group to AID_SDCARD_RW
+    {
+    	if (fs_prepare_dir(secure_path, 0770, AID_SYSTEM,AID_SDCARD_RW) != 0) {
+        	return -1;
+    	}
+    }
+    else
+    {
+    	if (fs_prepare_dir(secure_path, 0770, AID_SYSTEM,AID_MEDIA_RW) != 0) {
+        	return -1;
+    	}
     }
 
     if (mount(secure_path, SEC_ASECDIR_EXT, "", MS_BIND, NULL)) {
@@ -497,7 +674,7 @@ int Volume::mountAsecExternal() {
 }
 
 int Volume::doUnmount(const char *path, bool force) {
-    int retries = 10;
+    int retries = 150;
 
     if (mDebug) {
         SLOGD("Unmounting {%s}, force = %d", path, force);
@@ -506,24 +683,25 @@ int Volume::doUnmount(const char *path, bool force) {
     while (retries--) {
         if (!umount(path) || errno == EINVAL || errno == ENOENT) {
             SLOGI("%s sucessfully unmounted", path);
+			notifyStateKernel(2);
             return 0;
         }
 
         int action = 0;
-
+		notifyStateKernel(3);
         if (force) {
-            if (retries == 1) {
+            if (retries <= 120) {
                 action = 2; // SIGKILL
-            } else if (retries == 2) {
+            } else if (retries <= 130) {
                 action = 1; // SIGHUP
             }
         }
-
-        SLOGW("Failed to unmount %s (%s, retries %d, action %d)",
+		if(retries%10==0)
+        	SLOGW("Failed to unmount %s (%s, retries %d, action %d)",
                 path, strerror(errno), retries, action);
 
         Process::killProcessesWithOpenFiles(path, action);
-        usleep(1000*1000);
+        usleep(1000*30);
     }
     errno = EBUSY;
     SLOGE("Giving up on unmount %s (%s)", path, strerror(errno));
@@ -535,6 +713,7 @@ int Volume::unmountVol(bool force, bool revert) {
 
     int flags = getFlags();
     bool providesAsec = (flags & VOL_PROVIDES_ASEC) != 0;
+    revert = mPartIdx == -1 ? false : revert;
 
     if (getState() != Volume::State_Mounted) {
         SLOGE("Volume %s unmount request when not mounted", getLabel());
@@ -561,7 +740,7 @@ int Volume::unmountVol(bool force, bool revert) {
     /* Now that the fuse daemon is dead, unmount it */
     if (doUnmount(getFuseMountpoint(), force) != 0) {
         SLOGE("Failed to unmount %s (%s)", getFuseMountpoint(), strerror(errno));
-        goto fail_remount_secure;
+        //goto fail_remount_secure;
     }
 
     /* Unmount the real sd card */
@@ -602,6 +781,31 @@ out_nomedia:
     setState(Volume::State_NoMedia);
     return -1;
 }
+
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+int Volume::unmountPartition(int major, int minor){
+    setState(Volume::State_Unmounting);
+    Partitions::iterator ir;
+    for (ir = mPartitions.begin(); ir != mPartitions.end(); ++ir)
+    {
+       if (((VolumePartition*)*ir)->major == major && ((VolumePartition*)*ir)->minor == minor)
+       {
+           SLOGD("Unmounting partition : %d ",((VolumePartition*)*ir)->mountpoint);
+           if (doUnmount(((VolumePartition*)*ir)->mountpoint, true)){
+           SLOGE("Failed to unmount  (%s)",  strerror(errno));
+            }else {
+           rmdir(((VolumePartition*)*ir)->mountpoint);
+           SLOGD("Success to unmount %s",((VolumePartition*)*ir)->mountpoint);
+           releaseLetter(((VolumePartition*)*ir)->letter);
+                delete(*ir);
+       mPartitions.erase(ir);
+       }
+       break;
+   }
+    }  
+    return 0;
+}
+#endif
 
 int Volume::initializeMbr(const char *deviceNode) {
     struct disk_info dinfo;
@@ -653,7 +857,7 @@ int Volume::extractMetadata(const char* devicePath) {
 
     std::string cmd;
     cmd = BLKID_PATH;
-    cmd += " -c /dev/null ";
+    cmd += " -c /data/data/blkid ";
     cmd += devicePath;
 
     FILE* fp = popen(cmd.c_str(), "r");
@@ -668,22 +872,57 @@ int Volume::extractMetadata(const char* devicePath) {
     if (fgets(line, sizeof(line), fp) != NULL) {
         ALOGD("blkid identified as %s", line);
 
-        char* start = strstr(line, "UUID=") + 5;
-        if (sscanf(start, "\"%127[^\"]\"", value) == 1) {
+        char* start = strstr(line, "UUID=");
+        if (start != NULL && sscanf(start + 5, "\"%127[^\"]\"", value) == 1) {
             setUuid(value);
         } else {
             setUuid(NULL);
         }
 
-        start = strstr(line, "LABEL=") + 6;
-        if (sscanf(start, "\"%127[^\"]\"", value) == 1) {
+        start = strstr(line, "LABEL=");
+        if (start != NULL && sscanf(start + 6, "\"%127[^\"]\"", value) == 1) {
             setUserLabel(value);
         } else {
             setUserLabel(NULL);
         }
     } else {
         ALOGW("blkid failed to identify %s", devicePath);
-        res = -1;
+        //res = -1;
+        int fd = open("/data/data/blkid", O_RDONLY);
+		if(fd<0)
+		{
+			ALOGD("---extractMetadata open cache fail---");
+			res = -1;
+			remove("/data/data/blkid");
+			goto done;
+		}
+		int nbytes = read(fd, line, sizeof(line) - 1);
+		if (nbytes <= 0) 
+		{
+			ALOGD("---extractMetadata read cache fail---");
+			res = -1;
+			close(fd);
+			remove("/data/data/blkid");
+			goto done;
+		}
+        char* start = strstr(line, devicePath);
+		start=strstr(line, "UUID=");
+        if (start != NULL && sscanf(start + 5, "\"%127[^\"]\"", value) == 1) {
+            setUuid(value);
+			ALOGD("---get uuid =%s",value);
+        } else {
+            setUuid(NULL);
+        }
+
+        start = strstr(line, "LABEL=");
+        if (start != NULL && sscanf(start + 6, "\"%127[^\"]\"", value) == 1) {
+            setUserLabel(value);
+			ALOGD("---get label =%s",value);
+        } else {
+            setUserLabel(NULL);
+        }
+		close(fd);
+		remove("/data/data/blkid");
     }
 
     pclose(fp);
@@ -695,3 +934,104 @@ done:
     }
     return res;
 }
+
+#ifdef SUPPORTED_MULTI_USB_PARTITIONS
+/*
+* getVolumeLabel
+*  use blkid to get volume label
+*/
+void Volume::getVolumeLabel(const char* devicePath,char* vLabel,char letter){
+   char *pfstype;
+   char *pfslabel;
+   blkid_cache cache = NULL;
+   
+   blkid_get_cache(&cache, "/dev/null");
+   pfstype = blkid_get_tag_value(cache, "TYPE",devicePath);
+   pfslabel = blkid_get_tag_value(cache, "LABEL",devicePath);
+   blkid_put_cache(cache);
+
+   
+   SLOGD(">>> getVolumeLabel .letter:%c",letter);
+
+   /* if you want to change mountpoint format ,
+    *  change codes below.
+    * WARNING:
+    *  1. BE SURE TO UNIQUENESS OF MOUNTPOINT NAME !!!
+   */
+   //SLOGD("getVolumeLabel : type : %s , label : %s",pfstype,pfslabel);
+   if(pfslabel) // success to get volume label
+   {
+       /* 
+       //JUST FOR DEBUG UNKONWN CODE VOLUM LABEL
+       char* p = pfslabel;
+       while(1){
+           SLOGD("pfslabel : %02x",*p);
+           if (*(++p) == 0)
+               break;
+       }*/
+
+       char utf8Label[255] = {0};
+       if (!strcmp(pfstype,"vfat"))
+       {
+           gb2312_to_utf8(utf8Label, 255, pfslabel, strlen(pfslabel));
+       }
+       else
+       {
+           strcpy(utf8Label,pfslabel);
+       }
+
+       //sprintf(vLabel,"%d_%d(%s)",major,minor,utf8Label);
+       sprintf(vLabel,"%c(%s)",letter,utf8Label);
+
+       free(pfstype);
+       free(pfslabel);
+       pfstype =NULL;
+       pfslabel = NULL;
+   }
+   else // unknow volume label
+   {
+       //sprintf(vLabel,"%d_%d(udisk)",major,minor);
+       sprintf(vLabel,"%c(udisk)",letter);
+   }
+
+   SLOGD("getVolumeLabel : devicePath : %s , type : %s , label : %s ",devicePath,pfstype,vLabel);
+   
+}
+
+size_t Volume::gb2312_to_utf8(char* pOut,size_t pOutLen, char* pIn, size_t pInlen)
+{
+   UErrorCode ErrorCode = U_ZERO_ERROR;
+   size_t ret = ucnv_convert("utf-8","gbk",pOut,pOutLen,pIn,pInlen,&ErrorCode);
+   return 0;
+}
+
+char Volume::getNextLetter()
+{
+    /*
+     * A = 65 , C = 67 , Z = 90
+     * mLetters first bit = A
+    */
+    int i = 1,n = 0;
+    for (n = 0; n < 26; n++)
+    {
+        SLOGW("i:%d n:%d mLetters :%d",i,n,mLetters);
+        if (i & mLetters)
+        {
+            i = 1 << (n + 1);
+        }
+        else
+        {
+            SLOGW("n : %d",n);
+            mLetters |= 1 << n;
+            return (char)(n + 65);
+        }
+            
+    }
+    return 0;
+}
+
+void Volume::releaseLetter(char letter)
+{
+    mLetters &= (~(1 << (int32_t)letter-65));
+}
+#endif 

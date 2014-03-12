@@ -169,11 +169,12 @@ int Fat::doMount(const char *fsPath, const char *mountPoint,
     return rc;
 }
 
-int Fat::format(const char *fsPath, unsigned int numSectors, bool wipe) {
+int Fat::format(const char *fsPath, unsigned int numSectors, bool wipe, const char *label) {
     int fd;
-    const char *args[10];
+    const char *args[12];
     int rc;
     int status;
+    int num_args;
 
     if (wipe) {
         Fat::wipe(fsPath, numSectors);
@@ -191,14 +192,33 @@ int Fat::format(const char *fsPath, unsigned int numSectors, bool wipe) {
         char tmp[32];
         snprintf(tmp, sizeof(tmp), "%u", numSectors);
         const char *size = tmp;
-        args[7] = "-s";
-        args[8] = size;
-        args[9] = fsPath;
-        rc = android_fork_execvp(ARRAY_SIZE(args), (char **)args, &status,
+        if (strlen(label) > 0) {
+            args[7] = "-L";
+            args[8] = label;
+            args[9] = "-s";
+            args[10] = size;
+            args[11] = fsPath;
+            num_args = 12;
+        } else {
+            args[7] = "-s";
+            args[8] = size;
+            args[9] = fsPath;
+            num_args = 10;
+        }
+        rc = android_fork_execvp(num_args, (char **)args, &status,
                 false, true);
     } else {
-        args[7] = fsPath;
-        rc = android_fork_execvp(8, (char **)args, &status, false,
+        SLOGE("label : %s, fsPath : %s", label, fsPath);
+        if (strlen(label) > 0) {
+            args[7] = "-L";
+            args[8] = label;
+            args[9] = fsPath;
+            num_args = 10;
+        } else {
+            args[7] = fsPath;
+            num_args = 8;
+        }
+        rc = android_fork_execvp(num_args, (char **)args, &status, false,
                 true);
     }
 
@@ -225,6 +245,10 @@ int Fat::format(const char *fsPath, unsigned int numSectors, bool wipe) {
         return -1;
     }
     return 0;
+}
+
+int Fat::format(const char *fsPath, unsigned int numSectors, bool wipe) {
+    return Fat::format(fsPath, numSectors, wipe, "");
 }
 
 void Fat::wipe(const char *fsPath, unsigned int numSectors) {

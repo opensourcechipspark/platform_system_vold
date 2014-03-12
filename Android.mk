@@ -11,6 +11,7 @@ common_src_files := \
 	Process.cpp \
 	Ext4.cpp \
 	Fat.cpp \
+	Ntfs.cpp \
 	Loop.cpp \
 	Devmapper.cpp \
 	ResponseCode.cpp \
@@ -25,7 +26,9 @@ common_c_includes := \
 	external/openssl/include \
 	external/stlport/stlport \
 	bionic \
-	external/scrypt/lib/crypto
+	external/scrypt/lib/crypto \
+    external/e2fsprogs/lib \
+    external/icu4c/common 
 
 common_shared_libraries := \
 	libsysutils \
@@ -36,12 +39,15 @@ common_shared_libraries := \
 	libhardware_legacy \
 	liblogwrap \
 	libext4_utils \
-	libcrypto
+	libcrypto \
+    libicuuc 
 
 common_static_libraries := \
 	libfs_mgr \
 	libscrypt_static \
-	libmincrypt
+	libmincrypt \
+    libext2_blkid \
+    libext2_uuid
 
 include $(CLEAR_VARS)
 
@@ -50,6 +56,10 @@ LOCAL_MODULE := libvold
 LOCAL_SRC_FILES := $(common_src_files)
 
 LOCAL_C_INCLUDES := $(common_c_includes)
+
+ifeq ($(strip $(BUILD_WITH_MULTI_USB_PARTITIONS)), true)
+LOCAL_CFLAGS += -DSUPPORTED_MULTI_USB_PARTITIONS
+endif
 
 LOCAL_SHARED_LIBRARIES := $(common_shared_libraries)
 
@@ -70,9 +80,17 @@ LOCAL_SRC_FILES := \
 LOCAL_C_INCLUDES := $(common_c_includes)
 
 LOCAL_CFLAGS := -Werror=format
+ifeq ($(strip $(BUILD_WITH_MULTI_USB_PARTITIONS)), true)
+LOCAL_CFLAGS += -DSUPPORTED_MULTI_USB_PARTITIONS
+endif
 
 LOCAL_SHARED_LIBRARIES := $(common_shared_libraries)
-
+LOCAL_SRC_FILES := \
+       MiscManager.cpp \
+	   Misc.cpp \
+	   G3Dev.cpp \
+	   $(LOCAL_SRC_FILES)
+LOCAL_CFLAGS += -DUSE_USB_MODE_SWITCH
 LOCAL_STATIC_LIBRARIES := $(common_static_libraries)
 
 include $(BUILD_EXECUTABLE)
