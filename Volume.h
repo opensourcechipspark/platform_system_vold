@@ -65,6 +65,7 @@ protected:
     char* mUserLabel;
     VolumeManager *mVm;
     bool mDebug;
+	bool mSkipAsec;
     int mPartIdx;
     int mOrigPartIdx;
     bool mRetryMount;

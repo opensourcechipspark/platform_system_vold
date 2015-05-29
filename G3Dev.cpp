@@ -59,7 +59,7 @@ G3Dev::~G3Dev() {
 
 int G3Dev::handleUsbEvent(NetlinkEvent *evt) {
  const char *devtype = evt->findParam("DEVTYPE");
-    if( strcmp(devtype, "usb_device") )
+    if( devtype!=NULL &&strcmp(devtype, "usb_device") )
         return 0;
 	pid_t status ;
 
@@ -67,7 +67,7 @@ int G3Dev::handleUsbEvent(NetlinkEvent *evt) {
 	if( action == NetlinkEvent::NlActionAdd )
 	{
         const char *product = evt->findParam("PRODUCT");
-        if( product[0] != 0 && devtype[0] != 0 )
+        if(product!=NULL && product[0] != 0 && devtype[0] != 0 )
         {
             // ªÒ»°VID/PID
             int vid = 0;

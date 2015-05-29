@@ -128,6 +128,7 @@ Volume::Volume(VolumeManager *vm, const fstab_rec* rec, int flags) {
     mCurrentlyMountedKdev = -1;
     mPartIdx = rec->partnum;
     mRetryMount = false;
+	mSkipAsec =false;
 #ifdef SUPPORTED_MULTI_USB_PARTITIONS
     mLetters = 0;
 #endif
@@ -205,7 +206,7 @@ void Volume::setUserLabel(const char* userLabel) {
 //to inform SDMMC-driver for umounting sdcard. noted by xbw@2011-06-07
 void Volume::notifyStateKernel(int number)
 {
-    if(!strcmp(getLabel(),"external_sd"))
+    if(!strncmp(getLabel(),"external_sd", strlen("external_sd")))
     {
         FILE *fp = fopen("/sys/sd-sdio/rescan","w");
         if(fp){
@@ -546,8 +547,12 @@ UDISKNOMOUNTED:
         	if (Fat::doMount(devicePath, mount_point, false, false, false,
         	        AID_SYSTEM,AID_SDCARD_RW, 0002, true)) {
         		SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
-        
-                	if(Ntfs::doMount(devicePath, mount_point, false, 1000)){ 
+        			if(providesAsec)
+        			{
+						mSkipAsec = true;
+						SLOGE("---------set mSkipAsec to disable app2sd because mount Vfat fail for %s, mountpoint =%s",getLabel(),getMountpoint());
+					}
+                	if(Ntfs::doMount(devicePath, mount_point, false,AID_SYSTEM,AID_SDCARD_RW)){ 
                			SLOGE("%s failed to mount via VNTFS (%s)\n", devicePath, strerror(errno));
 #ifdef SUPPORTED_MULTI_USB_PARTITIONS
                         if (!strcmp(getLabel(),USB_DISK_LABEL)){
@@ -559,6 +564,11 @@ UDISKNOMOUNTED:
                 		continue;
                		}
         	}
+			else//mount flash as fat succeed
+			{
+				mSkipAsec = false;
+				SLOGE("---------set mSkipAsec to enable app2sd because mount Vfat succeed for %s, mountpoint =%s",getLabel(),getMountpoint());
+			}
 	    }
 	    else //do not has ums,set group to AID_MEDIA_RW
 	    {
@@ -566,7 +576,7 @@ UDISKNOMOUNTED:
                		AID_SYSTEM,AID_MEDIA_RW, 0002, true)) {
             		SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
             
-			    if(Ntfs::doMount(devicePath, mount_point, false, 1000)){
+			    if(Ntfs::doMount(devicePath, mount_point, false,AID_SYSTEM,AID_MEDIA_RW)){
                			SLOGE("%s failed to mount via VNTFS (%s)\n", devicePath, strerror(errno));
 #ifdef SUPPORTED_MULTI_USB_PARTITIONS
                         if (!strcmp(getLabel(),USB_DISK_LABEL)){
@@ -594,7 +604,7 @@ UDISKNOMOUNTED:
 #endif
         extractMetadata(devicePath);
 
-        if (providesAsec && mountAsecExternal() != 0) {
+        if (providesAsec&&!mSkipAsec&& mountAsecExternal() != 0) {
             SLOGE("Failed to mount secure area (%s)", strerror(errno));
             umount(mount_point);
             setState(Volume::State_Idle);
@@ -669,7 +679,7 @@ int Volume::mountAsecExternal() {
                 SEC_ASECDIR_EXT, strerror(errno));
         return -1;
     }
-
+	property_set("sys.vold.hasAsec","true"); 
     return 0;
 }
 
@@ -712,7 +722,7 @@ int Volume::unmountVol(bool force, bool revert) {
     int i, rc;
 
     int flags = getFlags();
-    bool providesAsec = (flags & VOL_PROVIDES_ASEC) != 0;
+    bool providesAsec = ((flags & VOL_PROVIDES_ASEC) != 0)&&(!mSkipAsec);
     revert = mPartIdx == -1 ? false : revert;
 
     if (getState() != Volume::State_Mounted) {
@@ -732,9 +742,17 @@ int Volume::unmountVol(bool force, bool revert) {
 
     // TODO: determine failure mode if FUSE times out
 
-    if (providesAsec && doUnmount(Volume::SEC_ASECDIR_EXT, force) != 0) {
-        SLOGE("Failed to unmount secure area on %s (%s)", getMountpoint(), strerror(errno));
-        goto out_mounted;
+    if (providesAsec) {
+		if(doUnmount(Volume::SEC_ASECDIR_EXT, force) != 0)
+		{
+        	SLOGE("Failed to unmount secure area on %s (%s)", getMountpoint(), strerror(errno));
+        	goto out_mounted;
+		}
+		else
+		{
+			property_set("sys.vold.hasAsec","false"); 
+			SLOGE("Succeed to umount secure area on %s",getMountpoint());
+		}
     }
 
     /* Now that the fuse daemon is dead, unmount it */

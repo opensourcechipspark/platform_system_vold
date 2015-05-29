@@ -46,7 +46,7 @@ static char NTFS_3G_PATH[] = "/system/bin/ntfs-3g";
 
 extern "C" int mount(const char *, const char *, const char *, unsigned long, const void *);
 
-int Ntfs::doMount(const char *fsPath, const char *mountPoint, bool ro, int ownerUid) {
+int Ntfs::doMount(const char *fsPath, const char *mountPoint, bool ro, int ownerUid,int ownerGid) {
 	int rc = 0;
     do {
 		if(ro){
@@ -80,13 +80,17 @@ int Ntfs::doMount(const char *fsPath, const char *mountPoint, bool ro, int owner
 			}
 		}else{
 			int status;
-			const char *args[3];
+			const char *args[5];
         	args[0] = NTFS_3G_PATH;
         	args[1] = fsPath;
         	args[2] = mountPoint;
-        	//args[3] = "-o";
+        	args[3] = "-o";
         	//args[4] = "ro,uid=1000";
+                char mountData[255];
+                sprintf(mountData," ro,utf8,uid=%d,gid=%d", ownerUid, ownerGid);
+        	args[4] = mountData;
 
+		SLOGE("Mount NTFS device form %s ===============",args[4]);
         	//rc = logwrap(5, args, 1);
 			 rc = android_fork_execvp(ARRAY_SIZE(args), (char **)args, &status,
 			                 false, true);

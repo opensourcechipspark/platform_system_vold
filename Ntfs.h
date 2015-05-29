@@ -21,7 +21,7 @@
 
 class Ntfs {
 public:
-	static int doMount(const char *fsPath, const char *mountPoint, bool ro, int ownerUid);
+	static int doMount(const char *fsPath, const char *mountPoint, bool ro, int ownerUid,int ownerGid);
 	static int unMount(const char *mountPoint);
 	static int format(const char *fsPath, unsigned int numSectors);
 };
